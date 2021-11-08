@@ -101,7 +101,7 @@
 -- :}
 module Data.Macaw.Symbolic.Memory (
   -- * Memory Management
-  MemPtrTable,
+  MemPtrTable(..),
   toCrucibleEndian,
   newGlobalMemory,
   MemoryModelContents(..),
