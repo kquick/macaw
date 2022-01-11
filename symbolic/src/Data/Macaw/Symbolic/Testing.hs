@@ -198,8 +198,9 @@ functionName dfi = maybe addrName fromByteString (MD.discoveredFunSymbol dfi)
 -- *translation* of programs into Crucible, while 'MS.MacawArchEvalFn' is used
 -- during symbolic execution (to provide interpretations to
 -- architecture-specific primitives).
-simulateAndVerify :: forall arch sym ids w t st fs
+simulateAndVerify :: forall arch sym bak ids w t st fs
                    . ( CB.IsSymInterface sym
+                     , CB.IsBoolSolver sym bak
                      , CCE.IsSyntaxExtension (MS.MacawExt arch)
                      , MM.MemWidth (MC.ArchAddrWidth arch)
                      , w ~ MC.ArchAddrWidth arch
@@ -212,7 +213,7 @@ simulateAndVerify :: forall arch sym ids w t st fs
                   -- ^ The solver adapter to use to discharge assertions
                   -> WS.LogData
                   -- ^ A logger to (optionally) record solver interaction (for the goal solver)
-                  -> sym
+                  -> bak
                   -- ^ The symbolic backend
                   -> [CS.GenericExecutionFeature sym]
                   -- ^ Crucible execution features, see 'defaultExecFeatures' for a good initial selection
@@ -227,7 +228,8 @@ simulateAndVerify :: forall arch sym ids w t st fs
                   -> MD.DiscoveryFunInfo arch ids
                   -- ^ The function to simulate and verify
                   -> IO SimulationResult
-simulateAndVerify goalSolver logger sym execFeatures archInfo archVals mem (ResultExtractor withResult) dfi =
+simulateAndVerify goalSolver logger bak execFeatures archInfo archVals mem (ResultExtractor withResult) dfi =
+  let sym = CB.backendGetSym bak in
   MS.withArchConstraints archVals $ do
     let funName = functionName dfi
     halloc <- CFH.newHandleAllocator
@@ -235,9 +237,9 @@ simulateAndVerify goalSolver logger sym execFeatures archInfo archVals mem (Resu
 
     let endianness = MSM.toCrucibleEndian (MAI.archEndianness archInfo)
     let ?recordLLVMAnnotation = \_ _ _ -> return ()
-    (initMem, memPtrTbl) <- MSM.newGlobalMemory (Proxy @arch) sym endianness MSM.ConcreteMutable mem
+    (initMem, memPtrTbl) <- MSM.newGlobalMemory (Proxy @arch) bak endianness MSM.ConcreteMutable mem
     let globalMap = MSM.mapRegionPointers memPtrTbl
-    (memVar, stackPointer, execResult) <- simulateFunction sym execFeatures archVals halloc initMem globalMap g
+    (memVar, stackPointer, execResult) <- simulateFunction bak execFeatures archVals halloc initMem globalMap g
     case execResult of
       CS.TimeoutResult {} -> return SimulationTimeout
       CS.AbortedResult {} -> return SimulationAborted
@@ -252,7 +254,7 @@ simulateAndVerify goalSolver logger sym execFeatures archInfo archVals mem (Resu
               --
               -- The result is treated as true if it is not equal to zero
               zero <- WI.bvLit sym resRepr (BVS.mkBV resRepr 0)
-              bv_val <- CLM.projectLLVM_bv sym val
+              bv_val <- CLM.projectLLVM_bv bak val
               notZero <- WI.bvNe sym bv_val zero
               goal <- WI.notPred sym notZero
               WS.solver_adapter_check_sat goalSolver sym logger [goal] $ \satRes ->
@@ -279,13 +281,14 @@ simulateAndVerify goalSolver logger sym execFeatures archInfo archVals mem (Resu
 simulateFunction :: ( ext ~ MS.MacawExt arch
                     , CCE.IsSyntaxExtension ext
                     , CB.IsSymInterface sym
+                    , CB.IsBoolSolver sym bak
                     , CLM.HasLLVMAnn sym
                     , MS.SymArchConstraints arch
                     , w ~ MC.ArchAddrWidth arch
                     , 16 <= w
                     , ?memOpts :: CLM.MemOptions
                     )
-                 => sym
+                 => bak
                  -> [CS.GenericExecutionFeature sym]
                  -> MS.ArchVals arch
                  -> CFH.HandleAllocator
@@ -296,7 +299,8 @@ simulateFunction :: ( ext ~ MS.MacawExt arch
                        , CLM.LLVMPtr sym w
                        , CS.ExecResult (MS.MacawSimulatorState sym) sym ext (CS.RegEntry sym (MS.ArchRegStruct arch))
                        )
-simulateFunction sym execFeatures archVals halloc initMem globalMap g = do
+simulateFunction bak execFeatures archVals halloc initMem globalMap g = do
+  let sym = CB.backendGetSym bak
   let symArchFns = MS.archFunctions archVals
   let crucRegTypes = MS.crucArchRegTypes symArchFns
   let regsRepr = CT.StructRepr crucRegTypes
@@ -313,8 +317,8 @@ simulateFunction sym execFeatures archVals halloc initMem globalMap g = do
   stackArrayStorage <- WI.freshConstant sym (WSym.safeSymbol "stack_array") WI.knownRepr
   stackSize <- WI.bvLit sym WI.knownRepr (BVS.mkBV WI.knownRepr (2 * 1024 * 1024))
   let ?ptrWidth = WI.knownRepr
-  (stackBasePtr, mem1) <- CLM.doMalloc sym CLM.StackAlloc CLM.Mutable "stack_alloc" initMem stackSize CLD.noAlignment
-  mem2 <- CLM.doArrayStore sym mem1 stackBasePtr CLD.noAlignment stackArrayStorage stackSize
+  (stackBasePtr, mem1) <- CLM.doMalloc bak CLM.StackAlloc CLM.Mutable "stack_alloc" initMem stackSize CLD.noAlignment
+  mem2 <- CLM.doArrayStore bak mem1 stackBasePtr CLD.noAlignment stackArrayStorage stackSize
 
   -- Make initial registers, including setting up a stack pointer (which points
   -- into the middle of the stack allocation, to allow accesses into the caller
@@ -333,7 +337,7 @@ simulateFunction sym execFeatures archVals halloc initMem globalMap g = do
   let fnBindings = CFH.insertHandleMap (CCC.cfgHandle g) (CS.UseCFG g (CAP.postdomInfo g)) CFH.emptyHandleMap
   MS.withArchEval archVals sym $ \archEvalFn -> do
     let extImpl = MS.macawExtensions archEvalFn memVar globalMap lookupFunction lookupSyscall validityCheck
-    let ctx = CS.initSimContext sym CLI.llvmIntrinsicTypes halloc IO.stdout (CS.FnBindings fnBindings) extImpl MS.MacawSimulatorState
+    let ctx = CS.initSimContext bak CLI.llvmIntrinsicTypes halloc IO.stdout (CS.FnBindings fnBindings) extImpl MS.MacawSimulatorState
     let s0 = CS.InitialState ctx initGlobals CS.defaultAbortHandler regsRepr simAction
     res <- CS.executeCrucible (fmap CS.genericToExecutionFeature execFeatures) s0
     return (memVar, sp, res)
@@ -343,10 +347,10 @@ simulateFunction sym execFeatures archVals halloc initMem globalMap g = do
 --
 -- The online constraints allow us to turn on path satisfiability checking
 data SomeBackend sym where
-  SomeOnlineBackend :: ( sym ~ CBO.OnlineBackend scope solver fs
+  SomeOnlineBackend :: ( sym ~ WE.ExprBuilder scope st fs
                        , WPO.OnlineSolver solver
                        , CB.IsSymInterface sym
-                       ) => sym -> SomeBackend sym
+                       ) => CBO.OnlineBackend solver scope st fs -> SomeBackend sym
   SomeOfflineBackend :: sym -> SomeBackend sym
 
 -- | A default set of execution features that are flexible enough to support a
@@ -357,8 +361,9 @@ defaultExecFeatures :: SomeBackend sym -> IO [CS.GenericExecutionFeature sym]
 defaultExecFeatures backend =
   case backend of
     SomeOfflineBackend {} -> return []
-    SomeOnlineBackend sym -> do
-      pathSat <- CSP.pathSatisfiabilityFeature sym (CBO.considerSatisfiability sym)
+    SomeOnlineBackend bak -> do
+      let sym = CB.backendGetSym bak
+      pathSat <- CSP.pathSatisfiabilityFeature sym (CBO.considerSatisfiability bak)
       return [pathSat]
 
 -- | This type wraps up a function that takes the post-state of a symbolic
