@@ -72,6 +72,9 @@ import           Lang.Crucible.LLVM.MemModel
                    , pattern LLVMPointerRepr
                    , llvmPointer_bv
                    )
+import           Lang.Crucible.LLVM.MemModel.Pointer
+                   ( llvmPointerOffset
+                   )
 
 import qualified Data.Macaw.CFG.Core as M
 import qualified Data.Macaw.CFG.Core as MC
@@ -355,7 +358,7 @@ pureSem sym fn = do
   let bak = symBackend sym
   case fn of
     M.EvenParity x0 ->
-      do x <- getBitVal (symBackend sym) x0
+      do x <- getBitVal' (symBackend sym) x0
          evalE sym $ app $ Not $ foldr1 xor [ bvTestBit x i | i <- [ 0 .. 7 ] ]
       where xor a b = app (BoolXor a b)
     M.ReadFSBase    -> error " ReadFSBase"
@@ -892,6 +895,18 @@ getBitVal bak (AtomWrapper x) =
      case regType x of
        LLVMPointerRepr w -> return (ValBV w v)
        _ -> error "getBitVal: impossible"
+
+getBitVal' ::
+  (IsSymInterface sym, IsBoolSolver sym bak) =>
+  bak ->
+  AtomWrapper (RegEntry sym) (M.BVType w) ->
+  IO (E sym (BVType w))
+getBitVal' _bak (AtomWrapper x) =
+  do let v = llvmPointerOffset (regValue x)
+     case regType x of
+       LLVMPointerRepr w -> return (ValBV w v)
+       _ -> error "getBitVal': impossible"
+
 
 toValBV ::
   (IsSymInterface sym, IsBoolSolver sym bak) =>
